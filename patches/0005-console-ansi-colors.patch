@@ -1,0 +1,159 @@
+diff --git a/twrpinstall/twinstall.cpp b/twrpinstall/twinstall.cpp
+index 6abccea7..295bbad1 100755
+--- a/twrpinstall/twinstall.cpp
++++ b/twrpinstall/twinstall.cpp
+@@ -32,6 +32,8 @@
+ 
+ #include <string.h>
+ #include <stdio.h>
++#include <string>
++#include <vector>
+ #include <cutils/properties.h>
+ 
+ #include <android-base/unique_fd.h>
+@@ -153,6 +155,89 @@ static int Prepare_Update_Binary(ZipArchiveHandle Zip) {
+ }
+ 
+ 
++// ANSI SGR (ESC[..m) support for the installer console, so update scripts can
++// colourize their ui_print() lines. The console colourizes whole lines, so the
++// last foreground color of the line wins. The names returned here are theme
++// variables (see gui/theme/<theme>/ui.xml), resolved by ConvertStrToColor().
++static const char* ansi_color_names[2][8] = {
++	{ "ansi_black", "ansi_red", "ansi_green", "ansi_yellow",
++	  "ansi_blue", "ansi_magenta", "ansi_cyan", "ansi_white" },
++	{ "ansi_bright_black", "ansi_bright_red", "ansi_bright_green", "ansi_bright_yellow",
++	  "ansi_bright_blue", "ansi_bright_magenta", "ansi_bright_cyan", "ansi_bright_white" }
++};
++
++static std::string ansi_color_name(int base, bool bright) {
++	if (base < 0 || base > 7)
++		return "";
++	return ansi_color_names[bright ? 1 : 0][base];
++}
++
++// Removes every ANSI SGR sequence from 'text' and returns the name of the color
++// they ask for, or an empty string to keep the default console color.
++static std::string ansi_strip_sgr(std::string& text) {
++	int base = -1;
++	bool bold = false, bright = false;
++
++	size_t pos = 0;
++	while ((pos = text.find('\x1b', pos)) != std::string::npos) {
++		if (pos + 1 >= text.size() || text[pos + 1] != '[') {
++			++pos;
++			continue;
++		}
++		size_t end = pos + 2;
++		while (end < text.size() && (isdigit((unsigned char)text[end]) || text[end] == ';'))
++			++end;
++		if (end >= text.size() || text[end] != 'm') {
++			// Not an SGR sequence; leave it alone like before.
++			++pos;
++			continue;
++		}
++
++		std::string params = text.substr(pos + 2, end - pos - 2);
++		std::vector<int> args;
++		size_t p = 0;
++		while (true) {
++			size_t semi = params.find(';', p);
++			std::string tok = params.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
++			args.push_back(tok.empty() ? 0 : atoi(tok.c_str()));
++			if (semi == std::string::npos)
++				break;
++			p = semi + 1;
++		}
++
++		for (size_t i = 0; i < args.size(); ++i) {
++			int n = args[i];
++			if (n == 0) {
++				base = -1;
++				bold = false;
++			} else if (n == 1) {
++				bold = true;
++			} else if (n == 22) {
++				bold = false;
++			} else if (n == 39) {
++				base = -1;
++			} else if (n >= 30 && n <= 37) {
++				base = n - 30;
++				bright = bold;
++			} else if (n >= 90 && n <= 97) {
++				base = n - 90;
++				bright = true;
++			} else if (n == 38 || n == 48) {
++				// Extended colour (38;5;N or 38;2;R;G;B): the console only has
++				// named colours, so just skip its parameters.
++				if (i + 1 < args.size() && args[i + 1] == 5)
++					i += 2;
++				else if (i + 1 < args.size() && args[i + 1] == 2)
++					i += 4;
++			}
++		}
++
++		text.erase(pos, end - pos + 1);
++	}
++
++	return ansi_color_name(base, bright);
++}
++
+ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) {
+ 	int ret_val, pipe_fd[2], status, zip_verify;
+ 	char buffer[1024];
+@@ -215,7 +300,12 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype)
+ 		} else if (strcmp(command, "ui_print") == 0) {
+ 			char* display_value = strtok(NULL, "\n");
+ 			if (display_value) {
+-				gui_print("%s", display_value);
++				std::string text(display_value);
++				std::string color = ansi_strip_sgr(text);
++				if (color.empty())
++					gui_print("%s", text.c_str());
++				else
++					gui_print_color(color.c_str(), "%s", text.c_str());
+ 			} else {
+ 				gui_print("\n");
+ 			}
+diff --git a/twrp.cpp b/twrp.cpp
+index eedc581a..6cda0ff9 100644
+--- a/twrp.cpp
++++ b/twrp.cpp
+@@ -130,6 +130,9 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
+ 	snprintf(crash_prop_val, sizeof(crash_prop_val), "%d", crash_counter);
+ 	property_set("twrp.crash_counter", crash_prop_val);
+ 
++	// Let update scripts know the installer console understands ANSI SGR colours
++	property_set("twrp.console_ansi", "1");
++
+ 	if (crash_counter == 0) {
+ 		property_list(Print_Prop, NULL);
+ 		printf("\n");
+diff --git a/gui/theme/portrait_hdpi/ui.xml b/gui/theme/portrait_hdpi/ui.xml
+index 104c3f66..f961fb2f 100755
+--- a/gui/theme/portrait_hdpi/ui.xml
++++ b/gui/theme/portrait_hdpi/ui.xml
+@@ -191,6 +194,23 @@
+ 		<variable name="warning" value="#F8F8A0"/>
+ 		<variable name="error" value="#FF0101"/>
+ 		<variable name="highlight" value="#0090CA"/>
++		<!-- ANSI colours for the installer console (ui_print with SGR codes) -->
++		<variable name="ansi_black" value="#4A4A4A"/>
++		<variable name="ansi_red" value="#FF5F56"/>
++		<variable name="ansi_green" value="#5FD068"/>
++		<variable name="ansi_yellow" value="#F8F8A0"/>
++		<variable name="ansi_blue" value="#4A9EFF"/>
++		<variable name="ansi_magenta" value="#C678DD"/>
++		<variable name="ansi_cyan" value="#4ED0E0"/>
++		<variable name="ansi_white" value="#D8D8D8"/>
++		<variable name="ansi_bright_black" value="#6E6E6E"/>
++		<variable name="ansi_bright_red" value="#FF8A80"/>
++		<variable name="ansi_bright_green" value="#8AF08A"/>
++		<variable name="ansi_bright_yellow" value="#FFFFC0"/>
++		<variable name="ansi_bright_blue" value="#7FBFFF"/>
++		<variable name="ansi_bright_magenta" value="#E0A0F0"/>
++		<variable name="ansi_bright_cyan" value="#8FE8F0"/>
++		<variable name="ansi_bright_white" value="#FFFFFF"/>
+ 		<variable name="fileselector_linecolor" value="#555555"/>
+ 		<variable name="fileselector_highlight_color" value="#555555"/>
+ 		<variable name="fileselector_separatorheight" value="2"/>

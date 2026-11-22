@@ -66,6 +66,32 @@ without making the status bar much taller; instead the clock is moved to
 centered (default) clock placement is changed; the `TW_CUSTOM_CLOCK_POS`
 variants are untouched.
 
+## 0005 - installer console: ANSI colours in `ui_print` lines
+
+The console page (where the zip installer output appears) only supported a colour
+per line chosen by TWRP itself. `twrpinstall/twinstall.cpp` now parses ANSI SGR
+sequences (`ESC[..m`) in the `ui_print` text, strips them (so `recovery.log`/ORS
+stay clean) and prints the line with the requested colour.
+
+* Palette: the `ansi_*` and `ansi_bright_*` variables in
+  `gui/theme/portrait_hdpi/ui.xml`; `ConvertStrToColor()` already resolves theme
+  variables, so they can be tweaked there.
+* Supported: `0` reset, `1`/`22` bold (bright variant), `30-37`, `39`, `90-97`.
+  Background codes (`40-47`, `49`, `100-107`) and `38;5;N` / `38;2;r;g;b` are
+  ignored: the console colours whole lines.
+* One colour per line (the last SGR in the line wins).
+
+`twrp.cpp` sets `twrp.console_ansi=1` at boot so update scripts can detect the
+feature and stay compatible with TWRP builds that do not have this patch:
+
+```edify
+ui_print(concat(ifelse(getprop("twrp.console_ansi") == "1", "\x1b[94m", ""), "text"));
+```
+
+On an unpatched TWRP the escapes are never sent and the line is printed as
+before; otherwise the `ESC` byte would be drawn as a missing glyph followed by a
+literal `[94m`.
+
 ## BoardConfig: panel brightness and real screen off
 
 * `TW_MAX_BRIGHTNESS := 486`: the panel reports `max_brightness=486`; with the
