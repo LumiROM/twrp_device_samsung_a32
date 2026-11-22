@@ -6,6 +6,14 @@ source $CONFIG
 # Change to the Source Directry
 cd /root/work
 
+# Apply the device patches to the TWRP sources
+# (repo sync resets bootable/recovery, so they live in the device tree)
+if [ -x "$DT_PATH/patches/apply_patches.sh" ]; then
+    "$DT_PATH/patches/apply_patches.sh" "$PWD" || { echo "ERROR: Failed to apply TWRP patches!" && exit 1; }
+else
+    echo "WARNING: $DT_PATH/patches/apply_patches.sh not found, building unpatched sources."
+fi
+
 # Set-up ccache
 if [ -z "$CCACHE_SIZE" ]; then
     ccache -M 10G

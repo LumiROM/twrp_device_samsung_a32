@@ -1,0 +1,286 @@
+diff --git a/data.cpp b/data.cpp
+index 00785242..4d558ff6 100644
+--- a/data.cpp
++++ b/data.cpp
+@@ -57,6 +57,7 @@ int                                     DataManager::mInitialized = 0;
+ InfoManager                             DataManager::mPersist;  // Data that that is not constant and will be saved to the settings file
+ InfoManager                             DataManager::mData;     // Data that is not constant and will not be saved to settings file
+ InfoManager                             DataManager::mConst;    // Data that is constant and will not be saved to settings file
++bool                                    DataManager::mPersistDirty = false; // Settings changed since the last save
+ 
+ extern bool datamedia;
+ 
+@@ -254,6 +255,7 @@ int DataManager::LoadValues(const string& filename)
+ 	// Read in the file, if possible
+ 	pthread_mutex_lock(&m_valuesLock);
+ 	mPersist.LoadValues();
++	mPersistDirty = false;
+ 
+ #ifndef TW_NO_SCREEN_TIMEOUT
+ 	blankTimer.setTime(mPersist.GetIntValue("tw_screen_timeout_secs"));
+@@ -278,21 +280,63 @@ int DataManager::Flush()
+ 	return SaveValues();
+ }
+ 
++// Saves the settings if they changed, but at most once every few seconds so
++// that dragging a slider doesn't write the settings file on every frame.
++// This makes settings survive any way of leaving recovery (power button,
++// adb reboot, a raw reboot command, a crash...) instead of only the reboot
++// option of the TWRP GUI, which is the only place that used to flush them.
++int DataManager::FlushIfNeeded()
++{
++#ifndef TW_OEM_BUILD
++	static time_t last_flush = 0;
++	time_t now;
++
++	if (!mPersistDirty || mBackingFile.empty())
++		return 0;
++
++	now = time(NULL);
++	if (last_flush != 0 && now - last_flush < 5)
++		return 0;
++
++	// Keep retrying later instead of showing an error popup from the GUI loop
++	// if the settings storage is not available right now.
++	if (!PartitionManager.Mount_Settings_Storage(false))
++		return 0;
++
++	last_flush = now;
++	mPersistDirty = false;
++	return SaveValues();
++#else
++	return 0;
++#endif
++}
++
+ int DataManager::SaveValues()
+ {
+ #ifndef TW_OEM_BUILD
+-	if (mBackingFile.empty())
++	if (mBackingFile.empty()) {
++		LOGERR("Settings file path is not set, unable to save settings.\n");
+ 		return -1;
++	}
+ 
+ 	string mount_path = GetSettingsStoragePath();
++	if (mount_path.empty()) {
++		LOGERR("Settings storage path is not set, unable to save settings to '%s'.\n", mBackingFile.c_str());
++		return -1;
++	}
+ 	PartitionManager.Mount_By_Path(mount_path.c_str(), 1);
+ 
+ 	mPersist.SetFile(mBackingFile);
+ 	mPersist.SetFileVersion(FILE_VERSION);
+ 	pthread_mutex_lock(&m_valuesLock);
+-	mPersist.SaveValues();
++	int ret = mPersist.SaveValues();
+ 	pthread_mutex_unlock(&m_valuesLock);
+ 
++	if (ret != 0) {
++		LOGERR("Unable to save settings file values to '%s'.\n", mBackingFile.c_str());
++		return -1;
++	}
++
+ 	tw_set_default_metadata(mBackingFile.c_str());
+ 	LOGINFO("Saved settings file values to '%s'\n", mBackingFile.c_str());
+ #endif // ifdef TW_OEM_BUILD
+@@ -418,11 +462,18 @@ int DataManager::SetValue(const string& varName, const string& value, const int
+ 	}
+ 
+ 	if (persist) {
+-		mPersist.SetValue(varName, value);
++		string old_value;
++		if (mPersist.GetValue(varName, old_value) != 0 || old_value != value) {
++			mPersist.SetValue(varName, value);
++			mPersistDirty = true;
++		}
+ 	} else {
+ 		int persistChk = mPersist.GetValue(varName, test);
+ 		if (persistChk == 0) {
+-			mPersist.SetValue(varName, value);
++			if (test != value) {
++				mPersist.SetValue(varName, value);
++				mPersistDirty = true;
++			}
+ 		} else {
+ 			mData.SetValue(varName, value);
+ 		}
+@@ -1143,7 +1194,13 @@ string DataManager::GetCurrentStoragePath(void)
+ 
+ string DataManager::GetSettingsStoragePath(void)
+ {
+-	return GetStrValue("tw_settings_path");
++	string path = GetStrValue("tw_settings_path");
++	// Fall back to the default location if tw_settings_path was never set (for
++	// example when /data/media/0 does not exist yet), otherwise the settings
++	// would be written relative to the root of the ramdisk and lost on reboot.
++	if (path.empty())
++		path = TW_STORAGE_PATH;
++	return path;
+ }
+ 
+ void DataManager::Vibrate(const string& varName)
+diff --git a/data.hpp b/data.hpp
+index d89966e6..80fa7cd4 100755
+--- a/data.hpp
++++ b/data.hpp
+@@ -32,6 +32,7 @@ public:
+ 	static int LoadValues(const string& filename);
+ 	static int LoadPersistValues(void);
+ 	static int Flush();
++	static int FlushIfNeeded();
+ 	static void LoadTWRPFolderInfo(void);
+ 
+ 	// Core get routines
+@@ -72,6 +73,7 @@ protected:
+ 	static InfoManager mPersist;
+ 	static InfoManager mData;
+ 	static InfoManager mConst;
++	static bool mPersistDirty;
+ 
+ 	static map<string, string> mConstValues;
+ 
+diff --git a/gui/gui.cpp b/gui/gui.cpp
+index 874cdd9f..781b278d 100755
+--- a/gui/gui.cpp
++++ b/gui/gui.cpp
+@@ -650,6 +650,7 @@ static int runPages(const char *page_name, const int stop_on_page_done)
+ 		}
+ 
+ 		blankTimer.checkForTimeout();
++		DataManager::FlushIfNeeded();
+ 		if (stop_on_page_done && DataManager::GetIntValue("tw_page_done") != 0)
+ 		{
+ 			gui_changePage("main");
+@@ -802,27 +803,9 @@ extern "C" int gui_loadResources(void)
+ 
+ 	if (check == 0)
+ 	{
+-		std::string theme_path;
++		std::string theme_path = TWFunc::Find_Custom_Theme();
+ 
+-		theme_path = DataManager::GetSettingsStoragePath();
+-		if (!PartitionManager.Mount_Settings_Storage(false))
+-		{
+-			int retry_count = 5;
+-			while (retry_count > 0 && !PartitionManager.Mount_Settings_Storage(false))
+-			{
+-				usleep(500000);
+-				retry_count--;
+-			}
+-
+-			if (!PartitionManager.Mount_Settings_Storage(true))
+-			{
+-				LOGINFO("Unable to mount %s during GUI startup.\n", theme_path.c_str());
+-				check = 1;
+-			}
+-		}
+-
+-		theme_path += "theme/ui.zip";
+-		if (check || PageManager::LoadPackage("TWRP", theme_path, "main"))
++		if (theme_path.empty() || PageManager::LoadPackage("TWRP", theme_path, "main"))
+ 		{
+ #endif // ifndef TW_OEM_BUILD
+ 			if (PageManager::LoadPackage("TWRP", TWRES "ui.xml", "main"))
+@@ -849,15 +832,9 @@ error:
+ extern "C" int gui_loadCustomResources(void)
+ {
+ #ifndef TW_OEM_BUILD
+-	if (!PartitionManager.Mount_Settings_Storage(false)) {
+-		LOGINFO("Unable to mount settings storage during GUI startup.\n");
+-		return -1;
+-	}
+-
+-	std::string theme_path = DataManager::GetSettingsStoragePath();
+-	theme_path += "theme/ui.zip";
++	std::string theme_path = TWFunc::Find_Custom_Theme();
+ 	// Check for a custom theme
+-	if (TWFunc::Path_Exists(theme_path)) {
++	if (!theme_path.empty()) {
+ 		// There is a custom theme, try to load it
+ 		if (PageManager::ReloadPackage("TWRP", theme_path)) {
+ 			// Custom theme failed to load, try to load stock theme
+diff --git a/gui/pages.cpp b/gui/pages.cpp
+index d970fdae..13e0bf14 100755
+--- a/gui/pages.cpp
++++ b/gui/pages.cpp
+@@ -1505,14 +1505,8 @@ int PageManager::RunReload() {
+ 		return 0;
+ 
+ 	mReloadTheme = false;
+-	theme_path = DataManager::GetSettingsStoragePath();
+-	if (PartitionManager.Mount_By_Path(theme_path.c_str(), 1) < 0) {
+-		LOGERR("Unable to mount %s during gui_reload_theme function.\n", theme_path.c_str());
+-		ret_val = 1;
+-	}
+-
+-	theme_path += "theme/ui.zip";
+-	if (ret_val != 0 || ReloadPackage("TWRP", theme_path) != 0)
++	theme_path = TWFunc::Find_Custom_Theme();
++	if (theme_path.empty() || ReloadPackage("TWRP", theme_path) != 0)
+ 	{
+ 		// Loading the custom theme failed - try loading the stock theme
+ 		LOGINFO("Attempting to reload stock theme...\n");
+@@ -1528,6 +1522,9 @@ int PageManager::RunReload() {
+ 			LoadLanguage(DataManager::GetStrValue("tw_language"));
+ 		}
+ 	}
++	// Save any pending changes before re-reading the settings file, otherwise
++	// values changed in this session would be discarded by the reload.
++	DataManager::Flush();
+ 	DataManager::ReadSettingsFile();
+ 	// This makes the console re-translate
+ 	GUIConsole::Clear_For_Retranslation();
+diff --git a/twrp-functions.cpp b/twrp-functions.cpp
+index 1a404c6c..8ebaffed 100644
+--- a/twrp-functions.cpp
++++ b/twrp-functions.cpp
+@@ -1511,6 +1511,36 @@ exit:
+ 	return TW_DEFAULT_RECOVERY_FOLDER;
+ }
+ 
++// Returns the path to a custom theme's ui.zip, or an empty string if there is none.
++// TWRP 12.1 moved the settings storage to /data/recovery and only looks for the
++// theme there, so themes installed the classic way in the TWRP folder on the
++// sdcard were silently ignored. Check both locations.
++std::string TWFunc::Find_Custom_Theme() {
++	std::string settings_path = DataManager::GetSettingsStoragePath();
++	if (!settings_path.empty()) {
++		if (!PartitionManager.Mount_Settings_Storage(false)) {
++			int retry_count = 5;
++			while (retry_count > 0 && !PartitionManager.Mount_Settings_Storage(false)) {
++				usleep(500000);
++				retry_count--;
++			}
++		}
++		std::string candidate = settings_path + "theme/ui.zip";
++		if (Path_Exists(candidate))
++			return candidate;
++	}
++
++	std::string storage_path = DataManager::GetCurrentStoragePath();
++	if (!storage_path.empty()) {
++		PartitionManager.Mount_By_Path(storage_path, false);
++		std::string candidate = storage_path + TW_DEFAULT_RECOVERY_FOLDER + "/theme/ui.zip";
++		if (Path_Exists(candidate))
++			return candidate;
++	}
++
++	return "";
++}
++
+ bool TWFunc::Check_Xml_Format(const std::string filename) {
+ 	std::string buffer(' ', 4);
+ 	std::string abx_hdr("ABX\x00", 4);
+diff --git a/twrp-functions.hpp b/twrp-functions.hpp
+index 203638a6..250e162b 100644
+--- a/twrp-functions.hpp
++++ b/twrp-functions.hpp
+@@ -119,6 +119,7 @@ public:
+ 	static void List_Mounts(); // List current mounts by the kernel
+ 	static void Clear_Bootloader_Message(); // Removes the bootloader message from misc for next boot
+ 	static string Check_For_TwrpFolder(); // Gets user defined path on storage where backups should be stored
++	static std::string Find_Custom_Theme(); // Gets the path of the custom theme's ui.zip, empty if there is none
+ 	static bool Check_Xml_Format(const std::string filename); // Return whether a xml is in plain xml or ABX format
+ 	static bool Find_Fstab(string &fstab);
+ 	static bool Get_Service_From_Manifest(std::string basepath, std::string service, std::string &ret);

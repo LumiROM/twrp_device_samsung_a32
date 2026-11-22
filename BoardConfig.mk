@@ -141,10 +141,17 @@ TW_THEME := portrait_hdpi
 RECOVERY_SDCARD_ON_DATA := true
 TARGET_RECOVERY_PIXEL_FORMAT := "RGBX_8888"
 TW_BRIGHTNESS_PATH := "/sys/class/backlight/panel/brightness"
-TW_MAX_BRIGHTNESS := 306
-TW_DEFAULT_BRIGHTNESS := 200
-TW_Y_OFFSET := 50
-TW_H_OFFSET := -50
+# Real panel max_brightness is 486 (was 306, so the slider only reached ~63%).
+# The define must stay: minuitwrp's fbdev_blank uses it for the unblank value.
+TW_MAX_BRIGHTNESS := 486
+TW_DEFAULT_BRIGHTNESS := 316
+# The stock portrait_hdpi theme (1080x1920) is scaled to 1080x2400 (1.0 x 1.25).
+# Any y offset leaves a black band above the status bar, and a negative h offset
+# leaves one below the navbar, so let the theme fill the whole screen instead.
+TW_Y_OFFSET := 0
+TW_H_OFFSET := 0
+# Keep the status bar (clock/temperature) below the camera notch
+TW_STATUS_ICONS_ALIGN := bottom
 TW_NO_REBOOT_BOOTLOADER := true
 TW_HAS_DOWNLOAD_MODE := true
 TW_INCLUDE_NTFS_3G := true
@@ -155,7 +162,5 @@ TW_USE_TOOLBOX := true
 TARGET_USES_MKE2FS := true
 TW_NO_LEGACY_PROPS := true
 TW_NO_BIND_SYSTEM := true
-TW_NO_SCREEN_BLANK := true
 TW_USE_MODEL_HARDWARE_ID_FOR_DEVICE_ID := true
 TW_BACKUP_EXCLUSIONS := /data/fonts
-TW_INCLUDE_LIBRESETPROP := true

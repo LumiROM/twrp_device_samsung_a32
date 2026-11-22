@@ -1,0 +1,14 @@
+diff --git a/partitionmanager.cpp b/partitionmanager.cpp
+index 2766b4c0..185c2bb3 100755
+--- a/partitionmanager.cpp
++++ b/partitionmanager.cpp
+@@ -3717,7 +3717,8 @@ void TWPartitionManager::Unlock_Block_Partitions() {
+ 					continue;
+ 				}
+ 				if (ioctl(fd, BLKROSET, &OFF) == -1) {
+-					LOGERR("Unable to unlock %s: %s\n", block_device.c_str());
++					// Some block devices (e.g. mmcblk0boot0 on MTK) don't support
++					// BLKROSET. It is harmless, so don't spam the console with it.
+ 					continue;
+ 				}
+ 				close(fd);
